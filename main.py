@@ -1,6 +1,6 @@
 import os
 import sys
-import yaml
+import yaml, itertools
 import argparse
 import random
 import numpy as np
@@ -41,6 +41,21 @@ def setup_logger(logfile=None):
         logging.FileHandler(logfile) if logfile else logging.NullHandler()
     ])
 
+base_cfg = yaml.safe_load(open("base_config.yaml"))
+param_grid = {
+    'train.lr': [0.001, 0.002],
+    'train.epochs': [300, 400]
+}
+combinations = list(itertools.product(*param_grid.values()))
+for combo in combinations:
+    cfg = base_cfg.copy()
+    for k, v in zip(param_grid.keys(), combo):
+        section, key = k.split('.')
+        cfg[section][key] = v
+    with open(f'sweep_cfg_{combo}.yaml', 'w') as f:
+        yaml.dump(cfg, f)
+    os.system(f'python main.py --config sweep_cfg_{combo}.yaml')
+    
 # --------------------- 2. 데이터 처리 ---------------------
 def generate_data(N, cfg, save_path=None):
     x = np.random.uniform(-2, 2, N)
@@ -93,6 +108,36 @@ def load_data(h5_path):
     with h5py.File(h5_path, 'r') as hf:
         data = {k: hf[k][:] for k in hf.keys()}
     return data
+    
+def helmholtz_residual(coords, pred_field, region_mask, physics_param):
+    # 예: Δu + k^2 u = 0
+    grad = torch.autograd.grad(pred_field.sum(), coords, create_graph=True)[0]
+    laplacian = torch.autograd.grad(grad.sum(), coords, create_graph=True)[0].sum(1)
+    k = physics_param[:, 0]
+    res = laplacian + (k**2) * pred_field
+    return (res[region_mask==1]**2).mean()
+
+def multi_loss(pred, gt, region_mask, coords, physics_param):
+    loss_target = ...
+    loss_helmholtz = helmholtz_residual(coords, pred[:,0], region_mask, physics_param)
+    total_loss = loss_target + ... + 0.1*loss_helmholtz
+    return total_loss
+    
+# Dropout 사용: 모델 정의시 Dropout 포함 (ex. nn.Dropout(0.1))
+def predict_with_uncertainty(model, *args, mc=20):
+    model.train()  # Dropout 활성화
+    preds = []
+    for _ in range(mc):
+        preds.append(model(*args).detach().cpu().numpy())
+    preds = np.stack(preds, axis=0)
+    pred_mean = preds.mean(axis=0)
+    pred_std = preds.std(axis=0)  # 표준편차=불확실도
+    return pred_mean, pred_std
+
+# 사용 예시
+mean_pred, uncertainty = predict_with_uncertainty(model, coords, situation_feat, region_mask, physics_param)
+plt.scatter(coords.cpu().numpy()[:,2], mean_pred[:,0], c=uncertainty[:,0], cmap='hot')
+plt.colorbar(label='Uncertainty')
 
 # --------------------- 3. Neural Operator 아키텍처 ---------------------
 class FFTOperator(nn.Module):
@@ -118,19 +163,21 @@ class FNOOperator(nn.Module):
         return self.head(x)
 
 class Patchify(nn.Module):
-    """
-    입력 (N, D) 데이터를 3D grid patch로 변환
-    """
     def __init__(self, in_dim, patch_size, embed_dim):
         super().__init__()
         self.patch_size = patch_size
         self.proj = nn.Linear(in_dim, embed_dim)
     def forward(self, x, coords):
-        # x: (N, D)
-        # coords: (N, 3)
-        # 실제 patchify 코드는 좌표 기반 3D 패치 구분을 해야 함 (간단화)
-        x_proj = self.proj(x)
-        return x_proj  # (N, embed_dim)
+        # 실제 3D patch id 생성
+        patch_ids = (coords / self.patch_size).long()
+        unique_patches, patch_indices = torch.unique(patch_ids, dim=0, return_inverse=True)
+        # 각 patch별로 평균 또는 pooling (예시: mean)
+        patch_feats = []
+        for pid in range(unique_patches.shape[0]):
+            patch_mask = (patch_indices == pid)
+            patch_feats.append(self.proj(x[patch_mask]).mean(0, keepdim=True))
+        patch_feats = torch.cat(patch_feats, dim=0)
+        return patch_feats  # (num_patches, embed_dim)
 
 class PhysicsConditionEncoder(nn.Module):
     """
@@ -177,7 +224,12 @@ class RegionMLP(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
-        
+
+physics_param = np.zeros((N, 2), dtype=np.float32)  # (예: wavenumber, damping 등)
+physics_param[:, 0] = np.random.uniform(0.5, 3.0, N)  # 예시 wavenumber
+physics_param[:, 1] = np.random.uniform(0.01, 0.2, N)  # 예시 damping
+data = {..., 'physics_param': physics_param, ...}
+
 class SoftRegionOperator(nn.Module):
     def __init__(self, in_dim, out_dim, n_regions=5, phys_param_dim=2):
         super().__init__()
@@ -207,9 +259,9 @@ class PARONetExpRegion(nn.Module):
         self.soft_op = SoftRegionOperator(in_dim, out_dim, n_regions)
         self.coord_encoder = nn.Linear(3, in_dim-5)
 
-    def forward(self, coords, situation_feat, region_mask):
+    def forward(self, coords, situation_feat, region_mask, physics_param):
         feat = torch.cat([self.coord_encoder(coords), situation_feat], dim=1)
-        out = self.soft_op(feat, region_mask)
+        out = self.soft_op(feat, region_mask, coords, physics_param)
         return out
 
 # --------------------- 4. Physics-Informed Loss ---------------------
