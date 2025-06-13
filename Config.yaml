@@ -1,0 +1,9 @@
+seed: 42
+data:
+  N: 3500
+  load_path: null
+  save_path: './simdata/exp_simdata.h5'
+train:
+  epochs: 400
+  lr: 0.0015
+logdir: './logs/defense_sim'
