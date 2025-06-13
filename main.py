@@ -1,4 +1,5 @@
 import os
+import sys
 import yaml
 import argparse
 import random
@@ -11,17 +12,18 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, precision_score, recall_score
+from sklearn.metrics import mean_squared_error, precision_score, recall_score, confusion_matrix, f1_score
 import h5py
 import seaborn as sns
+import datetime
+import logging
 
-# --------------------- Config 관리 ---------------------
+# --------------------- 1. Config 및 환경 세팅 ---------------------
 def load_config(config_path):
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
     return cfg
 
-# --------------------- Seed / Device ---------------------
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -32,7 +34,14 @@ def set_seed(seed=42):
 def get_device():
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# --------------------- 데이터 로딩/생성/저장 ---------------------
+def setup_logger(logfile=None):
+    log_fmt = '[%(asctime)s][%(levelname)s] %(message)s'
+    logging.basicConfig(level=logging.INFO, format=log_fmt, handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(logfile) if logfile else logging.NullHandler()
+    ])
+
+# --------------------- 2. 데이터 처리 ---------------------
 def generate_data(N, cfg, save_path=None):
     x = np.random.uniform(-2, 2, N)
     y = np.random.uniform(-2, 2, N)
@@ -74,6 +83,7 @@ def generate_data(N, cfg, save_path=None):
         'coords': coords, 'situation_feat': situation_feat, 'region_mask': region_mask, 'gt': gt
     }
     if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with h5py.File(save_path, 'w') as hf:
             for k, v in data.items():
                 hf.create_dataset(k, data=v)
@@ -84,7 +94,7 @@ def load_data(h5_path):
         data = {k: hf[k][:] for k in hf.keys()}
     return data
 
-# --------------------- Operator/Model ---------------------
+# --------------------- 3. Neural Operator 아키텍처 ---------------------
 class FFTOperator(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -160,9 +170,9 @@ class PARONetExpRegion(nn.Module):
         out = self.soft_op(feat, region_mask)
         return out
 
-# --------------------- Physics-Informed Loss (예시) ---------------------
+# --------------------- 4. Physics-Informed Loss ---------------------
 def physics_loss(coords, pred_field, region_mask):
-    # 간단 예시: target region의 gradient penalty (물리장 smoothness)
+    # target region의 gradient penalty (물리장 smoothness)
     grad = torch.autograd.grad(pred_field.sum(), coords, create_graph=True)[0]
     grad_norm = (grad[region_mask==1]**2).sum(1)
     return grad_norm.mean() if grad_norm.numel() > 0 else 0.0
@@ -177,15 +187,23 @@ def multi_loss(pred, gt, region_mask, coords):
     total_loss = loss_target + 0.08*(loss_risk + loss_jammer + loss_sensor + loss_bg) + 0.05*loss_phys
     return total_loss
 
-# --------------------- 학습/로깅/시각화 ---------------------
+# --------------------- 5. 실험/학습/평가 파이프라인 ---------------------
 def run_experiment(cfg):
     set_seed(cfg['seed'])
     device = get_device()
+    dt_now = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    exp_dir = os.path.join(cfg['logdir'], f'exp_{dt_now}')
+    os.makedirs(exp_dir, exist_ok=True)
+    setup_logger(os.path.join(exp_dir, 'exp.log'))
+    writer = SummaryWriter(exp_dir)
+
     # 데이터 준비
     if cfg['data']['load_path'] and os.path.exists(cfg['data']['load_path']):
         data = load_data(cfg['data']['load_path'])
+        logging.info(f"Loaded data from {cfg['data']['load_path']}")
     else:
         data = generate_data(cfg['data']['N'], cfg, cfg['data']['save_path'])
+        logging.info(f"Generated new data, saved to {cfg['data']['save_path']}")
     coords = torch.tensor(data['coords'], dtype=torch.float32, device=device).requires_grad_()
     situation_feat = torch.tensor(data['situation_feat'], dtype=torch.float32, device=device)
     region_mask = torch.tensor(data['region_mask'], dtype=torch.long, device=device)
@@ -193,12 +211,15 @@ def run_experiment(cfg):
     X_train, X_test, S_train, S_test, M_train, M_test, G_train, G_test = train_test_split(
         coords, situation_feat, region_mask, gt, test_size=0.2, random_state=cfg['seed']
     )
-    # 모델
+
+    # 모델 선언
     model = PARONetExpRegion(in_dim=8, out_dim=2, n_regions=5).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg['train']['lr'])
-    writer = SummaryWriter(cfg['logdir'])
-    # 학습
-    for epoch in tqdm(range(cfg['train']['epochs'])):
+    best_mse = float('inf')
+    best_model_path = os.path.join(exp_dir, "best_model.pth")
+
+    # 학습 루프
+    for epoch in tqdm(range(cfg['train']['epochs']), desc='Training'):
         model.train()
         pred = model(X_train, S_train, M_train)
         loss = multi_loss(pred, G_train, M_train, X_train)
@@ -206,9 +227,26 @@ def run_experiment(cfg):
         loss.backward()
         optimizer.step()
         writer.add_scalar('loss/train', loss.item(), epoch)
+        # 중간 validation
+        if epoch % 20 == 0 or epoch == cfg['train']['epochs']-1:
+            model.eval()
+            with torch.no_grad():
+                pred_val = model(X_test, S_test, M_test)
+                mse_val = mean_squared_error(G_test[:,0].cpu().numpy(), pred_val[:,0].cpu().numpy())
+                writer.add_scalar('mse/val', mse_val, epoch)
+                if mse_val < best_mse:
+                    torch.save(model.state_dict(), best_model_path)
+                    best_mse = mse_val
+            model.train()
         if epoch % 50 == 0:
-            print(f"Epoch {epoch} - Train Loss: {loss.item():.5f}")
-    # 테스트/분석
+            logging.info(f"Epoch {epoch} - Train Loss: {loss.item():.5f} - Val MSE: {mse_val:.5f}")
+
+    writer.close()
+    logging.info(f"최적 모델을 {best_model_path}에 저장")
+
+    # ----------------- 6. 결과 평가 및 시각화 -----------------
+    # 최적 모델 불러오기
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
     model.eval()
     with torch.no_grad():
         pred = model(X_test, S_test, M_test)
@@ -217,34 +255,74 @@ def run_experiment(cfg):
         target_pred = (torch.sigmoid(pred[:,1]) > 0.5).long().cpu().numpy()
         target_true = (G_test[:,1] > 0.5).long().cpu().numpy()
         mse = mean_squared_error(field_true, field_pred)
-        prec = precision_score(target_true, target_pred)
-        recall = recall_score(target_true, target_pred)
-        print(f"[TEST] Field MSE: {mse:.4f}, Precision: {prec:.3f}, Recall: {recall:.3f}")
-        # 시각화
-        fig, ax = plt.subplots(1,2,figsize=(12,4))
-        ax[0].scatter(X_test.cpu().numpy()[:,2], field_pred, c=M_test.cpu().numpy(), cmap='jet', s=8, alpha=0.7)
+        prec = precision_score(target_true, target_pred, zero_division=0)
+        recall = recall_score(target_true, target_pred, zero_division=0)
+        f1 = f1_score(target_true, target_pred, zero_division=0)
+        confmat = confusion_matrix(target_true, target_pred)
+        logging.info(f"[TEST] Field MSE: {mse:.4f}, Precision: {prec:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
+        logging.info(f"Confusion Matrix:\n{confmat}")
+
+        # region별 MSE
+        region_names = ['Background', 'Target', 'Risk', 'Jammer', 'Sensor']
+        for i in range(5):
+            if np.sum(M_test.cpu().numpy()==i) > 0:
+                mse_i = mean_squared_error(
+                    G_test[M_test==i,0].cpu().numpy(),
+                    pred[M_test==i,0].cpu().numpy())
+                logging.info(f"Region {i} ({region_names[i]}): MSE={mse_i:.5f}")
+
+        # 결과 저장/시각화
+        fig, ax = plt.subplots(1,2,figsize=(13,4))
+        s1 = ax[0].scatter(X_test.cpu().numpy()[:,2], field_pred, c=M_test.cpu().numpy(), cmap='jet', s=8, alpha=0.7)
+        plt.colorbar(s1, ax=ax[0], label="Region Mask")
         ax[0].set_title('Predicted Field (z axis)')
+        ax[0].set_xlabel('z (penetration axis)')
+        ax[0].set_ylabel('field')
         sns.histplot(torch.sigmoid(pred[M_test==1,1]).cpu().numpy(), bins=20, ax=ax[1], color='blue', label='Target pred', stat="density")
         sns.histplot(torch.sigmoid(pred[M_test!=1,1]).cpu().numpy(), bins=20, ax=ax[1], color='orange', label='Non-target pred', stat="density")
         ax[1].set_title('Target/Non-target Class (Sigmoid)')
+        ax[1].set_xlabel('Predicted Target ID')
         ax[1].legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(exp_dir, 'paronet_results.png'))
         plt.show()
-    writer.close()
 
-# --------------------- Config YAML 예시 ---------------------
+        # 추가: 결과 csv 저장
+        df = pd.DataFrame({
+            'z': X_test.cpu().numpy()[:,2],
+            'pred_field': field_pred,
+            'true_field': field_true,
+            'region_mask': M_test.cpu().numpy(),
+            'pred_target_id': torch.sigmoid(pred[:,1]).cpu().numpy(),
+            'true_target_id': G_test[:,1].cpu().numpy()
+        })
+        df.to_csv(os.path.join(exp_dir, 'paronet_test_results.csv'), index=False)
+        logging.info(f"결과를 {exp_dir}에 저장 완료")
+
+# --------------------- 7. Config YAML 예시 ---------------------
 EXAMPLE_YAML = """
 seed: 42
 data:
-  N: 3000
+  N: 3500
   load_path: null
-  save_path: './exp_simdata.h5'
+  save_path: './simdata/exp_simdata.h5'
 train:
-  epochs: 300
-  lr: 0.002
-logdir: './logs/exp_run'
+  epochs: 400
+  lr: 0.0015
+logdir: './logs/defense_sim'
 """
 
+# --------------------- 8. 명령행 인터페이스 및 실행 ---------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description='PARONet Defense Simulation Full Pipeline')
+    parser.add_argument('--config', type=str, default=None, help='Path to config YAML file')
+    args = parser.parse_args()
+    return args
+
 if __name__ == "__main__":
-    # config 파일 없이 바로 실행 예시
-    cfg = yaml.safe_load(EXAMPLE_YAML)
+    args = parse_args()
+    if args.config is not None:
+        cfg = load_config(args.config)
+    else:
+        cfg = yaml.safe_load(EXAMPLE_YAML)
     run_experiment(cfg)
