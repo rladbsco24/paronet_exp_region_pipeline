@@ -117,16 +117,55 @@ class FNOOperator(nn.Module):
     def forward(self, x):
         return self.head(x)
 
-class PSDTransformerNOOperator(nn.Module):
-    def __init__(self, in_dim, out_dim):
+class Patchify(nn.Module):
+    """
+    입력 (N, D) 데이터를 3D grid patch로 변환
+    """
+    def __init__(self, in_dim, patch_size, embed_dim):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(in_dim, 64), nn.GELU(),
-            nn.Linear(64, 64), nn.GELU(),
-            nn.Linear(64, out_dim)
-        )
-    def forward(self, x):
-        return self.trunk(x)
+        self.patch_size = patch_size
+        self.proj = nn.Linear(in_dim, embed_dim)
+    def forward(self, x, coords):
+        # x: (N, D)
+        # coords: (N, 3)
+        # 실제 patchify 코드는 좌표 기반 3D 패치 구분을 해야 함 (간단화)
+        x_proj = self.proj(x)
+        return x_proj  # (N, embed_dim)
+
+class PhysicsConditionEncoder(nn.Module):
+    """
+    PDE 파라미터 등 physics 정보 임베딩
+    """
+    def __init__(self, param_dim, embed_dim):
+        super().__init__()
+        self.fc = nn.Linear(param_dim, embed_dim)
+    def forward(self, param):
+        return self.fc(param)  # (N, embed_dim)
+
+class PSDTransformerNOOperator(nn.Module):
+    """
+    Patchify + Physics Condition 임베딩 + Transformer Encoder + Output Projection
+    """
+    def __init__(self, in_dim, out_dim, patch_size=8, embed_dim=128, n_layers=4, n_heads=4, phys_param_dim=2):
+        super().__init__()
+        self.patchify = Patchify(in_dim, patch_size, embed_dim)
+        self.physics_encoder = PhysicsConditionEncoder(phys_param_dim, embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.output_proj = nn.Linear(embed_dim, out_dim)
+    def forward(self, x, coords, physics_param):
+        # x: (N, in_dim)
+        # coords: (N, 3)
+        # physics_param: (N, phys_param_dim)
+        x_patch = self.patchify(x, coords)  # (N, embed_dim)
+        phys_embed = self.physics_encoder(physics_param)  # (N, embed_dim)
+        patch_in = x_patch + phys_embed
+        # (N, embed_dim) → (1, N, embed_dim) for transformer
+        transformer_in = patch_in.unsqueeze(0)
+        z = self.transformer(transformer_in)
+        z = z.squeeze(0)
+        out = self.output_proj(z)  # (N, out_dim)
+        return out
 
 class RegionMLP(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -138,25 +177,28 @@ class RegionMLP(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
-
+        
 class SoftRegionOperator(nn.Module):
-    def __init__(self, in_dim, out_dim, n_regions=5):
+    def __init__(self, in_dim, out_dim, n_regions=5, phys_param_dim=2):
         super().__init__()
         self.ops = nn.ModuleList([
             FFTOperator(in_dim, out_dim),
             FNOOperator(in_dim, out_dim),
-            PSDTransformerNOOperator(in_dim, out_dim),
+            PSDTransformerNOOperator(in_dim, out_dim, phys_param_dim=phys_param_dim),  # region 2 등에서 할당
             RegionMLP(in_dim, out_dim),
             RegionMLP(in_dim, out_dim)
         ])
         self.n_regions = n_regions
 
-    def forward(self, x, region_mask):
+    def forward(self, x, region_mask, coords, physics_param):
         outs = torch.zeros(x.shape[0], self.ops[0].kernel.shape[0], device=x.device)
         for i in range(self.n_regions):
             idxs = (region_mask == i)
             if torch.sum(idxs) > 0:
-                outs[idxs] = self.ops[i](x[idxs])
+                if isinstance(self.ops[i], PSDTransformerNOOperator):
+                    outs[idxs] = self.ops[i](x[idxs], coords[idxs], physics_param[idxs])
+                else:
+                    outs[idxs] = self.ops[i](x[idxs])
         return outs
 
 class PARONetExpRegion(nn.Module):
